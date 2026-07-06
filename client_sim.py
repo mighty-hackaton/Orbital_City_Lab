@@ -1,88 +1,91 @@
 import socket
 import json
 import time
-import math
 import random
-import osmnx as ox
-import networkx as nx
+
+import route_utils as ru
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5005
 VEHICLE_ID = "Борт-101"
 
-# Фіксована швидкість для стабільності
-BASE_SPEED_KMH = 35.0 
+# Було 1.0 (1 апдейт/сек) — звідси й "смикана" анімація на дашборді.
+# 0.5 = 2 апдейти/сек, помітно плавніше при тій самій логіці руху.
+SEND_PERIOD_SEC = 0.5
 
-print("⏳ Симулятор: Завантажую граф...")
-G = ox.graph_from_place("Podilskyi District, Kyiv, Ukraine", network_type="drive")
-nodes = list(G.nodes())
+# --- Природний шум швидкості ---
+# Реальне авто не тримає ідеально рівні 35.000 км/год навіть на прямій —
+# трохи "гуляє" через ногу на педалі газу, нерівності, вітер тощо.
+# Робимо це AR(1)-процесом (плавне блукання), а не незалежним шумом на
+# кожному тіку — інакше це виглядало б як тремтіння/дрож, а не природний рух.
+SPEED_NOISE_STD_KMH = 0.9    # амплітуда випадкового поштовху щотіку
+SPEED_NOISE_DECAY = 0.85     # 0..1: більше = повільніша, "плавніша" зміна шуму
+SPEED_NOISE_CLAMP_KMH = 3.0  # захист від рідкісного занадто великого викиду
 
-# 1. ФІКСОВАНИЙ МАРШРУТ (для стабільного демо)
-start_lat, start_lon = 50.4646, 30.5165 
-end_lat, end_lon = 50.4735, 30.4912 
-origin = ox.distance.nearest_nodes(G, X=start_lon, Y=start_lat)
-destination = ox.distance.nearest_nodes(G, X=end_lon, Y=end_lat)
-route = nx.shortest_path(G, origin, destination, weight='length')
-route_coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+# --- Цикл втрати зв'язку (РЕБ) ---
+REB_CYCLE_SEC = 20        # повний цикл: онлайн+офлайн разом, секунд
+REB_OFFLINE_START = 6     # з якої секунди циклу зникає зв'язок
+REB_OFFLINE_END = 14      # по яку секунду циклу зв'язок відсутній
 
-# Зберігаємо для дашборду
-with open("route_info.json", "w") as f:
-    json.dump({"path": [{"lat": lat, "lon": lon} for lat, lon in route_coords], 
-               "start": {"lat": route_coords[0][0], "lon": route_coords[0][1]},
-               "end": {"lat": route_coords[-1][0], "lon": route_coords[-1][1]}}, f)
+
+def is_signal_lost(seconds_elapsed):
+    phase = seconds_elapsed % REB_CYCLE_SEC
+    return REB_OFFLINE_START <= phase <= REB_OFFLINE_END
+
+
+print("⏳ Симулятор: отримую маршрут (з кешу route_info.json або рахую сам)...")
+route_coords = ru.load_or_build_route()
+print(f"✅ Маршрут готовий: {len(route_coords)} точок.")
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371000 
-    return R * math.acos(math.sin(math.radians(lat1))*math.sin(math.radians(lat2)) + 
-                         math.cos(math.radians(lat1))*math.cos(math.radians(lat2)) * math.cos(math.radians(lon2-lon1)))
-
-def get_speed_for_turn(idx, route_coords):
-    """Скидаємо швидкість, якщо попереду крутий поворот (наступні 2 вузли)"""
-    if idx + 2 >= len(route_coords): return BASE_SPEED_KMH
-    
-    # Розрахунок кута між сегментами
-    p1, p2, p3 = route_coords[idx], route_coords[idx+1], route_coords[idx+2]
-    v1 = (p2[0]-p1[0], p2[1]-p1[1])
-    v2 = (p3[0]-p2[0], p3[1]-p2[1])
-    angle = abs(math.atan2(v2[1], v2[0]) - math.atan2(v1[1], v1[0]))
-    
-    if angle > 0.5: return 20.0 # Пригальмовуємо на повороті
-    return BASE_SPEED_KMH
-
-# Рух
 current_idx = 0
 current_lat, current_lon = route_coords[0]
-seconds_elapsed = 0
+current_speed_kmh = ru.BASE_SPEED_KMH  # стартуємо на базовій швидкості
+speed_noise_kmh = 0.0
+seconds_elapsed = 0.0
 
 print("🚗 Рухаємось...")
 while current_idx < len(route_coords) - 1:
-    target_lat, target_lon = route_coords[current_idx + 1]
-    
-    # Визначаємо швидкість
-    current_speed_kmh = get_speed_for_turn(current_idx, route_coords)
+    # "Чиста" цільова швидкість — з ПОСТУПОВИМ гальмуванням перед поворотом
+    # (лінійна інтерполяція за відстанню до найближчого різкого повороту).
+    clean_target_kmh = ru.target_speed_for_position(route_coords, current_idx)
+
+    # Накладаємо природний шум: плавне випадкове блукання навколо цілі,
+    # обмежене зверху/знизу, щоб не з'їхати в абсурдні значення на повороті.
+    speed_noise_kmh = speed_noise_kmh * SPEED_NOISE_DECAY + random.gauss(0.0, SPEED_NOISE_STD_KMH)
+    speed_noise_kmh = max(-SPEED_NOISE_CLAMP_KMH, min(SPEED_NOISE_CLAMP_KMH, speed_noise_kmh))
+    noisy_target_kmh = max(0.0, clean_target_kmh + speed_noise_kmh)
+
+    # Реальна швидкість все одно не стрибає до цілі миттєво, а рухається до
+    # неї з обмеженим темпом розгону/гальмування — фізично правдоподібно,
+    # і заразом згладжує сам шум (не дає йому виглядати як тремтіння).
+    current_speed_kmh = ru.step_speed_toward(current_speed_kmh, noisy_target_kmh, dt_sec=SEND_PERIOD_SEC)
     speed_mps = current_speed_kmh * (1000 / 3600)
-    
-    dist_to_target = calculate_distance(current_lat, current_lon, target_lat, target_lon)
-    
-    if dist_to_target <= speed_mps:
-        current_lat, current_lon = target_lat, target_lon
-        current_idx += 1
-        continue
-    
-    ratio = speed_mps / dist_to_target
-    current_lat += (target_lat - current_lat) * ratio
-    current_lon += (target_lon - current_lon) * ratio
-    
-    # Відправка
-    if not (15 <= (seconds_elapsed % 40) <= 30): # РЕБ кожні 40 сек
-        packet = {"id": VEHICLE_ID, "lat": current_lat, "lon": current_lon, 
-                  "speed": current_speed_kmh, "heading": 0} # heading обчислить сервер
-        sock.sendto(json.dumps(packet).encode('utf-8'), (SERVER_IP, SERVER_PORT))
-        print(f"🟢 Стан: {current_speed_kmh} км/год")
+
+    heading = ru.heading_for_route_idx(route_coords, current_idx)
+
+    current_lat, current_lon, current_idx, reached_end = ru.advance_along_route(
+        route_coords, current_idx, current_lat, current_lon, speed_mps * SEND_PERIOD_SEC
+    )
+
+    if not is_signal_lost(seconds_elapsed):
+        packet = {
+            "id": VEHICLE_ID,
+            "lat": current_lat,
+            "lon": current_lon,
+            "speed": current_speed_kmh,
+            "heading": heading,
+        }
+        sock.sendto(json.dumps(packet).encode("utf-8"), (SERVER_IP, SERVER_PORT))
+        print(f"🟢 Стан: {current_speed_kmh:.1f} км/год | idx={current_idx} | t={seconds_elapsed:.1f}")
     else:
-        print("🔴 РЕБ: зв'язок відсутній")
-        
-    seconds_elapsed += 1
-    time.sleep(1)
+        print(f"🔴 РЕБ: зв'язок відсутній | t={seconds_elapsed:.1f}")
+
+    seconds_elapsed += SEND_PERIOD_SEC
+    time.sleep(SEND_PERIOD_SEC)
+
+    if reached_end:
+        break
+
+print("🏁 Маршрут завершено.")

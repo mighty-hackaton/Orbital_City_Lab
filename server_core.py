@@ -1,100 +1,127 @@
+import os
 import socket
 import json
 import time
-import math
-import numpy as np
-import osmnx as ox
-import networkx as nx
+
 import joblib
+
 import feature_utils
+import route_utils as ru
 
 # ==========================================
 # 1. КОНФІГУРАЦІЯ
 # ==========================================
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
-TIMEOUT_THRESHOLD = 3.0  
+
+TIMEOUT_THRESHOLD = 1.5
 STATE_FILE = "dashboard_state.json"
+# Синхронізовано з SEND_PERIOD_SEC у клієнті (0.5с) — частіші апдейти дають
+# плавнішу анімацію на дашборді замість "смиканого" руху раз на секунду.
+TICK_SEC = 0.5
+MIN_MOVE_FOR_HEADING_M = 1.0  # нижче — вважаємо GPS-джиттером, heading не чіпаємо
 
-print("⏳ Завантаження графа доріг Києва (це займе хвилину)...")
-G = ox.graph_from_place("Podilskyi District, Kyiv, Ukraine", network_type="drive")
-print(f"✅ Граф завантажено: {len(G.nodes)} перехресть.")
+# Модель (v3_heading) тренована на кроці 15 сек: 5 значень швидкості й курсу,
+# узятих РАЗ на 15 секунд, а не щосекунди. Годування моделі посекундним
+# вікном — той самий клас багів, що вже був з heading: формат входу не
+# збігається з тим, на чому тренувались, і прогноз тихо псується.
+MODEL_SAMPLE_INTERVAL_SEC = 15.0
+MODEL_HISTORY_LEN = 5
 
-print("⏳ Завантаження ML-моделі HistGradientBoostingRegressor...")
+print("⏳ Отримую маршрут (з кешу route_info.json або рахую сам)...")
+route_coords = ru.load_or_build_route()
+print(f"✅ Маршрут готовий: {len(route_coords)} точок. (граф OSM серверу під час роботи не потрібен)")
+
+print("⏳ Завантаження ML-моделі HistGradientBoostingRegressor (v3, з курсом)...")
 try:
-    ai_model = joblib.load('model.pkl')
+    ai_model = joblib.load("model.pkl")
     print("✅ Справжню модель підключено успішно!")
 except Exception as e:
     print(f"⚠️ Помилка завантаження моделі: {e}")
     ai_model = None
 
+
 # ==========================================
-# 2. ФІЗИКА ТА АЛГОРИТМИ
+# 2. ПРОГНОЗ ШВИДКОСТІ
 # ==========================================
-def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371000 
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    a = math.sin(math.radians(lat2 - lat1)/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(math.radians(lon2 - lon1)/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+def start_reb_prediction(state, current_time):
+    """Викликається ОДИН РАЗ у момент входу в РЕБ — а не щотіку.
 
-def calculate_bearing(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
+    Модель тренована на кроці 15 сек, тож повторний виклик з тим самим
+    вікном (адже під час РЕБ нових реальних даних не надходить) не дає нової
+    інформації, лише даремно навантажує CPU і плутає логи.
 
-def get_forward_node(lat, lon, heading):
+    Модель повертає ДЕЛЬТУ швидкості на 15 сек вперед:
+        ціль = остання_відома_швидкість + delta
+    Цю ціль далі лінійно розтягуємо на 15 секунд наперед (sample_interp_speed),
+    як і написано в model_metadata.json — а не застосовуємо миттєво.
+    """
+    last_speed = state["speed_buffer"][-1] if state["speed_buffer"] else ru.BASE_SPEED_KMH
+    speed_window = state.get("model_speed_window", [])
+    heading_window = state.get("model_heading_window", [])
+
+    geometric_target = ru.target_speed_for_position(route_coords, state["route_idx"])
+
+    if len(speed_window) >= MODEL_HISTORY_LEN and ai_model is not None:
+        try:
+            features = feature_utils.build_features(speed_window, heading_window)
+            delta = float(ai_model.predict([features])[0])
+            model_target = speed_window[-1] + delta
+            # Змішуємо прогноз моделі (довга памʼять — тренд за останню
+            # хвилину) з геометричним орієнтиром (знає МІСЦЕ на дорозі,
+            # чого в чистій історії швидкостей немає).
+            target_speed = 0.5 * model_target + 0.5 * geometric_target
+            print(f"    ↳ модель: {speed_window[-1]:.1f}+({delta:+.1f})={model_target:.1f} | "
+                  f"геометрія: {geometric_target:.1f} | ціль на 15с: {target_speed:.1f} км/год")
+        except Exception as e:
+            print(f"⚠️ Помилка прогнозу: {e}")
+            target_speed = geometric_target
+    else:
+        # Перші ~75 сек роботи (5 семплів × 15 сек) історії для моделі ще
+        # не вистачає — це очікувано, а не баг. До того часу орієнтуємось
+        # лише на геометрію маршруту.
+        target_speed = geometric_target
+        print(f"    ↳ недостатньо історії для моделі ({len(speed_window)}/{MODEL_HISTORY_LEN}), "
+              f"ціль лише за геометрією: {target_speed:.1f} км/год")
+
+    return {"start_time": current_time, "start_speed": last_speed, "target_speed": target_speed}
+
+
+def sample_interp_speed(interp, current_time):
+    """Лінійна інтерполяція поточної швидкості до цілі на MODEL_SAMPLE_INTERVAL_SEC
+    секунд вперед. Після завершення інтервалу тримає ціль сталою — інакше,
+    якщо РЕБ триває довше 15 сек, довелось би раз у раз прогнозувати з тих
+    самих застарілих даних і накопичувати помилку."""
+    elapsed = current_time - interp["start_time"]
+    ratio = min(1.0, elapsed / MODEL_SAMPLE_INTERVAL_SEC)
+    return interp["start_speed"] + ratio * (interp["target_speed"] - interp["start_speed"])
+
+
+def save_state_atomic(vehicles, max_retries=5, retry_delay=0.05):
+    """Запис через тимчасовий файл + os.replace.
+
+    На Windows os.replace() кидає PermissionError, якщо цільовий файл у цю
+    мілісекунду відкритий іншим процесом (типово — Streamlit-дашборд, який
+    читає dashboard_state.json раз на секунду, або антивірус/синхронізація
+    теки). Робимо кілька коротких повторних спроб, а якщо і вони не вдались —
+    пропускаємо цей кадр запису замість падіння всього сервера."""
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(vehicles, f)
+
+    for attempt in range(max_retries):
+        try:
+            os.replace(tmp, STATE_FILE)
+            return
+        except PermissionError:
+            time.sleep(retry_delay)
+
+    print(f"⚠️ Не вдалося оновити {STATE_FILE} (файл зайнятий іншим процесом), пропускаю кадр")
     try:
-        edge = ox.distance.nearest_edges(G, X=lon, Y=lat)
-        u, v = edge[0], edge[1]
-        
-        lat_u, lon_u = G.nodes[u]['y'], G.nodes[u]['x']
-        lat_v, lon_v = G.nodes[v]['y'], G.nodes[v]['x']
-        
-        diff_u = abs(calculate_bearing(lat, lon, lat_u, lon_u) - heading)
-        diff_u = min(diff_u, 360 - diff_u)
-        
-        diff_v = abs(calculate_bearing(lat, lon, lat_v, lon_v) - heading)
-        diff_v = min(diff_v, 360 - diff_v)
-        
-        return u if diff_u < diff_v else v
-    except Exception:
-        return ox.distance.nearest_nodes(G, X=lon, Y=lat)
+        os.remove(tmp)
+    except OSError:
+        pass
 
-def predict_next_graph_node(current_node, heading):
-    neighbors = list(G.successors(current_node))
-    if not neighbors: return current_node
-    
-    curr_lat, curr_lon = G.nodes[current_node]['y'], G.nodes[current_node]['x']
-    best_node, min_angle_diff = neighbors[0], 360
-
-    for neighbor in neighbors:
-        n_lat, n_lon = G.nodes[neighbor]['y'], G.nodes[neighbor]['x']
-        bearing = calculate_bearing(curr_lat, curr_lon, n_lat, n_lon)
-        diff = abs(bearing - heading)
-        diff = min(diff, 360 - diff)
-        if diff < min_angle_diff:
-            min_angle_diff = diff
-            best_node = neighbor
-    return best_node
-
-def get_ai_speed_prediction(vehicle_state):
-    speed_buffer = vehicle_state['speed_buffer']
-    current_speed = speed_buffer[-1] if speed_buffer else 0.0
-    
-    if len(speed_buffer) < 5 or not ai_model:
-        return current_speed
-
-    try:
-        features_1d = feature_utils.build_features(speed_buffer[-5:])
-        predicted_speed = float(ai_model.predict([features_1d])[0])
-        
-        # ЗАПОБІЖНИК: Згладжуємо прогноз і не даємо машині зупинитися (мінімум 15 км/год)
-        predicted_speed = np.clip(predicted_speed, current_speed - 2.0, current_speed + 2.0)
-        return max(15.0, predicted_speed)
-    except Exception:
-        return current_speed
 
 # ==========================================
 # 3. ОСНОВНИЙ ЦИКЛ СЕРВЕРА
@@ -102,103 +129,132 @@ def get_ai_speed_prediction(vehicle_state):
 vehicles = {}
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
-sock.settimeout(1.0)
+sock.settimeout(0.5)
 
 print(f"🚀 Сервер запущено. Слухаю порт {UDP_PORT}...")
 
 while True:
-    current_time = time.time()
-    
+    loop_start = time.time()
+    current_time = loop_start
+
     # --- ПРИЙОМ ДАНИХ (ОНЛАЙН) ---
     try:
         data, addr = sock.recvfrom(1024)
-        packet = json.loads(data.decode('utf-8'))
-        v_id = packet['id']
-        
+        packet = json.loads(data.decode("utf-8"))
+        v_id = packet["id"]
+
         if v_id not in vehicles:
-            vehicles[v_id] = {'speed_buffer': []}
-            
-        vehicles[v_id].update({
-            'last_seen': current_time, 
-            'lat': packet['lat'],
-            'lon': packet['lon'], 
-            'heading': packet['heading'], 
-            'is_predicted': False
+            vehicles[v_id] = {
+                "speed_buffer": [],
+                "heading": 0.0,
+                "route_idx": 0,
+                "model_speed_window": [],
+                "model_heading_window": [],
+                "next_model_sample_time": current_time,
+                "reb_interp": None,
+            }
+
+        state = vehicles[v_id]
+        prev_lat, prev_lon = state.get("lat"), state.get("lon")
+
+        # Heading рахуємо САМІ з реального переміщення між двома останніми
+        # точками, а не з поля пакета — клієнт його не рахує.
+        heading = state.get("heading", 0.0)
+        if prev_lat is not None:
+            moved = ru.calculate_distance(prev_lat, prev_lon, packet["lat"], packet["lon"])
+            if moved > MIN_MOVE_FOR_HEADING_M:
+                heading = ru.calculate_bearing(prev_lat, prev_lon, packet["lat"], packet["lon"])
+
+        # Прив'язуємо машину до найближчої точки ВІДОМОГО маршруту. Пошук
+        # обмежений околом попереднього route_idx, щоб не "перескочити" на
+        # схожу, але не ту ділянку дороги.
+        route_idx = ru.nearest_route_index(
+            route_coords, packet["lat"], packet["lon"], search_from=state.get("route_idx", 0)
+        )
+
+        state.update({
+            "last_packet_time": current_time,   # для рішення "звʼязок є / нема"
+            "last_update_time": current_time,   # для розрахунку dt фізичного кроку
+            "lat": packet["lat"],
+            "lon": packet["lon"],
+            "heading": heading,
+            "route_idx": route_idx,
+            "is_predicted": False,
+            "reb_interp": None,  # звʼязок відновився — старий прогноз більше не актуальний
         })
-        
-        if 'target_node' in vehicles[v_id]:
-            del vehicles[v_id]['target_node']
-            
-        vehicles[v_id]['speed_buffer'].append(packet['speed'])
-        if len(vehicles[v_id]['speed_buffer']) > 5:
-            vehicles[v_id]['speed_buffer'].pop(0)
 
-        print(f"[🟢 ONLINE] Авто {v_id} | Швидкість: {packet['speed']:.1f} км/год")
+        state["speed_buffer"].append(packet["speed"])
+        if len(state["speed_buffer"]) > 5:
+            state["speed_buffer"].pop(0)
 
-    except socket.timeout: pass
-    except Exception: pass
+        # Окремий буфер для МОДЕЛІ: семплюємо РАЗ на MODEL_SAMPLE_INTERVAL_SEC
+        # секунд, а не щопакета — інакше вікно не відповідатиме тому, на
+        # чому тренувались (посекундні дані замість 15-секундних).
+        if current_time >= state["next_model_sample_time"]:
+            state["model_speed_window"].append(packet["speed"])
+            state["model_heading_window"].append(heading)
+            if len(state["model_speed_window"]) > MODEL_HISTORY_LEN:
+                state["model_speed_window"].pop(0)
+                state["model_heading_window"].pop(0)
+            state["next_model_sample_time"] = current_time + MODEL_SAMPLE_INTERVAL_SEC
+
+        print(f"[🟢 ONLINE] Авто {v_id} | Швидкість: {packet['speed']:.1f} км/год | idx={route_idx}")
+
+    except socket.timeout:
+        pass
+    except Exception as e:
+        print(f"⚠️ Помилка прийому пакета: {e}")
 
     # --- АВТОНОМНИЙ РУХ (РЕБ) ---
     for v_id, state in vehicles.items():
-        if current_time - state['last_seen'] > TIMEOUT_THRESHOLD:
-            
-            predicted_speed = get_ai_speed_prediction(state)
-            
-            # Якщо РЕБ щойно увімкнувся, визначаємо першу ціль
-            if 'target_node' not in state:
-                state['target_node'] = get_forward_node(state['lat'], state['lon'], state['heading'])
-                
-            target_node = state['target_node']
-            current_lat, current_lon = state['lat'], state['lon']
-            
-            # Розраховуємо, скільки метрів маємо проїхати за цю секунду
+        if "lat" not in state:
+            continue
+        if current_time - state.get("last_packet_time", 0) > TIMEOUT_THRESHOLD:
+            if state.get("reb_interp") is None:
+                state["reb_interp"] = start_reb_prediction(state, current_time)
+
+            model_speed_now = sample_interp_speed(state["reb_interp"], current_time)
+            last_actual_speed = state["speed_buffer"][-1] if state["speed_buffer"] else ru.BASE_SPEED_KMH
+
+            # Той самий фізичний крок (обмежений темп розгону/гальмування),
+            # що й у клієнта — щоб прогноз змінювався так само плавно, як
+            # реальне авто, а не стрибав до цілі за один тік.
+            predicted_speed = max(15.0, ru.step_speed_toward(last_actual_speed, model_speed_now))
+
+            # dt рахуємо ФАКТИЧНИЙ, а не берем фіксований TICK_SEC. Раніше
+            # last_seen перезаписувався на current_time щотіку REB-блоку,
+            # через що умова "current_time - last_seen > TIMEOUT_THRESHOLD"
+            # одразу ставала хибною — сервер фактично оновлював позицію не
+            # щосекунди, а раз на TIMEOUT_THRESHOLD секунд, і при цьому рухав
+            # машину так, ніби минула лише 1 секунда. Тепер last_packet_time
+            # (рішення онлайн/офлайн) і last_update_time (для dt) розведені.
+            dt = current_time - state.get("last_update_time", current_time)
+            dt = max(0.0, min(dt, 5.0))  # захист від аномально великого dt (пауза дебагера тощо)
             speed_mps = predicted_speed * (1000 / 3600)
-            dist_to_move = speed_mps
-            
-            # МАГІЯ ЦИКЛУ: Проходимо всі мікро-вузли, поки не витратимо dist_to_move
-            loop_counter = 0
-            while dist_to_move > 0.1 and loop_counter < 10:
-                loop_counter += 1
-                target_lat = G.nodes[target_node]['y']
-                target_lon = G.nodes[target_node]['x']
-                
-                dist_to_target = calculate_distance(current_lat, current_lon, target_lat, target_lon)
-                
-                if dist_to_target > dist_to_move:
-                    # Рухаємось по відрізку і вичерпуємо дистанцію
-                    ratio = dist_to_move / dist_to_target
-                    current_lat += (target_lat - current_lat) * ratio
-                    current_lon += (target_lon - current_lon) * ratio
-                    dist_to_move = 0
-                else:
-                    # Ми доїхали до вузла, але дистанція ще лишилась!
-                    current_lat, current_lon = target_lat, target_lon
-                    dist_to_move -= dist_to_target
-                    
-                    next_node = predict_next_graph_node(target_node, state['heading'])
-                    if next_node == target_node:
-                        break # Тупик, зупиняємось
-                    
-                    # Синхронізуємо компас машини з новою вулицею
-                    new_heading = calculate_bearing(current_lat, current_lon, G.nodes[next_node]['y'], G.nodes[next_node]['x'])
-                    if new_heading != 0.0 or current_lat != G.nodes[next_node]['y']:
-                        state['heading'] = new_heading
-                        
-                    target_node = next_node
 
-            # Зберігаємо результати плавного руху
+            new_lat, new_lon, new_idx, reached_end = ru.advance_along_route(
+                route_coords, state["route_idx"], state["lat"], state["lon"], speed_mps * dt
+            )
+
+            if new_idx != state["route_idx"]:
+                state["heading"] = ru.heading_for_route_idx(route_coords, new_idx)
+
             state.update({
-                'lat': current_lat, 
-                'lon': current_lon,
-                'target_node': target_node,
-                'last_seen': current_time,
-                'is_predicted': True
+                "lat": new_lat,
+                "lon": new_lon,
+                "route_idx": new_idx,
+                "last_update_time": current_time,
+                "is_predicted": True,
             })
-            
-            state['speed_buffer'].append(predicted_speed)
-            if len(state['speed_buffer']) > 5: state['speed_buffer'].pop(0)
 
-            print(f"[🔴 РЕБ] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | Фізика: {speed_mps:.1f} м/с")
+            state["speed_buffer"].append(predicted_speed)
+            if len(state["speed_buffer"]) > 5:
+                state["speed_buffer"].pop(0)
 
-    with open(STATE_FILE, 'w') as f:
-        json.dump(vehicles, f)
+            tag = "🏁 КІНЕЦЬ МАРШРУТУ" if reached_end else "🔴 РЕБ"
+            print(f"[{tag}] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | idx={new_idx}")
+
+    save_state_atomic(vehicles)
+
+    elapsed = time.time() - loop_start
+    time.sleep(max(0.0, TICK_SEC - elapsed))
