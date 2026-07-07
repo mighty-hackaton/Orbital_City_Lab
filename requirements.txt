@@ -1,0 +1,5 @@
+streamlit>=1.45
+pydeck>=0.9
+numpy>=1.26,<2.0
+scikit-learn==1.6.1
+joblib>=1.3
