@@ -17,7 +17,7 @@ vehicles, no real jamming equipment, and no personal data involved.
 
 ## Try it
 
-▶️ **Live demo:** _add your Streamlit Community Cloud URL here after deploying (see below)_
+▶️ **Live demo:** https://huggingface.co/spaces/mariykart/REBoot
 
 ## How it works
 
@@ -46,57 +46,6 @@ The moment the (simulated) signal drops:
    simulated jam.
 4. As soon as signal returns, the app switches back to reporting the
    (simulated) real GPS position.
-
-## Two ways to run it
-
-### 1. Single self-contained app (what's deployed)
-
-Everything — simulated fleet, physics, ML inference — runs inside one
-Streamlit session, with no sockets or shared files. This is what makes it
-safe to deploy publicly: every visitor gets their own independent fleet
-simulation, and multiple visitors never interfere with each other.
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Then open the printed local URL in your browser. Use the sidebar to
-pause/resume, change the fleet size, or speed up playback.
-
-### 2. Local advanced mode (real UDP client/server)
-
-If you want to see the original client/server split — a simulated vehicle
-sending UDP packets and a separate server doing the dead-reckoning and
-writing state to disk — run these in two separate terminals:
-
-```bash
-# Terminal 1 — the "server" that receives GPS packets and predicts during signal loss
-python server_core.py
-
-# Terminal 2 — the "vehicle" sending simulated GPS packets over UDP
-python client_sim.py
-```
-
-This mode writes `dashboard_state.json` to disk, which the *original*
-version of `app.py` read from. It's kept for reference/local experimentation
-but is **not** used by the deployed, self-contained app, since a shared
-on-disk state file doesn't work safely with multiple concurrent visitors on
-a public site.
-
-## Deploying to Streamlit Community Cloud
-
-1. Push this repository to GitHub (public or private).
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with
-   your GitHub account.
-3. Click **New app**, pick this repository/branch, and set the main file
-   path to `app.py`.
-4. Deploy. Streamlit Cloud installs `requirements.txt` automatically and
-   gives you a public `*.streamlit.app` URL you can share with anyone.
-
-No extra configuration or secrets are required — the route is cached in
-`route_info.json` and the model is loaded from `model.pkl`, both already in
-the repo.
 
 ## Notes on the model
 
