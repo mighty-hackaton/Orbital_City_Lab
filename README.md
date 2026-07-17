@@ -1,3 +1,13 @@
+---
+title: REBoot
+emoji: 📡
+colorFrom: green
+colorTo: blue
+sdk: streamlit
+app_file: app.py
+pinned: false
+---
+
 # Orbital City Lab 🛰️
 
 **A resilient location layer for city transit: GPS + AI dead reckoning + Wi-Fi fingerprint sensor fusion, demonstrated on a simulated Kyiv bus/tram fleet.**

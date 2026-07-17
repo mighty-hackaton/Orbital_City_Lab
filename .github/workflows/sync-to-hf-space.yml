@@ -1,0 +1,25 @@
+name: Sync to Hugging Face Space
+
+# Дзеркалить main-гілку в git-репозиторій Hugging Face Space при кожному
+# push у GitHub. Space (huggingface.co/spaces/mariykart/REBoot) — це
+# ОКРЕМИЙ git-репозиторій, не форк і не клон GitHub; без цього кроку зміни
+# тут ніколи самі не з'являться на живому демо.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # дозволяє запустити вручну з вкладки Actions, без нового коміту
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # повна історія — force-push вимагає всіх комітів, не тільки останнього
+
+      - name: Push mirror to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add space https://mariykart:${HF_TOKEN}@huggingface.co/spaces/mariykart/REBoot
+          git push --force space HEAD:main
