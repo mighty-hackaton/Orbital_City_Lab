@@ -17,6 +17,35 @@ jobs:
         with:
           fetch-depth: 0  # повна історія — force-push вимагає всіх комітів, не тільки останнього
 
+      # Тимчасовий діагностичний крок: НІКОЛИ не друкує сам токен, лише його
+      # довжину (0 = секрет не долетів до job) і роль/статус за версією HF
+      # API — щоб не гадати, а точно побачити причину помилки авторизації.
+      # Прибрати цей крок, коли push нижче запрацює стабільно.
+      - name: Debug HF_TOKEN (safe — no secret value is ever printed)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          echo "Token length as seen by this job: ${#HF_TOKEN}"
+          if [ -z "$HF_TOKEN" ]; then
+            echo "❌ HF_TOKEN порожній у цьому job. Найімовірніші причини:"
+            echo "   - секрет доданий як 'Environment secret', а не 'Repository secret'"
+            echo "     (тоді job має явно вказувати 'environment: <назва>')"
+            echo "   - назва секрету не збігається символ-в-символ з HF_TOKEN"
+            exit 1
+          fi
+          echo "✅ HF_TOKEN має значення. Перевіряю його валідність і роль через HF API..."
+          http_code=$(curl -s -o /tmp/whoami.json -w "%{http_code}" -H "Authorization: Bearer ${HF_TOKEN}" https://huggingface.co/api/whoami-v2)
+          echo "HTTP статус /api/whoami-v2: ${http_code}"
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Токен НЕ валідний (сервер відповів ${http_code}, не 200) — імовірно протух/відкликаний/скопійований з помилкою."
+            cat /tmp/whoami.json
+            exit 1
+          fi
+          echo "Ідентичність токена (тільки безпечні поля, без секретів):"
+          echo "  name: $(jq -r '.name // "?"' /tmp/whoami.json)"
+          echo "  type: $(jq -r '.type // "?"' /tmp/whoami.json)"
+          echo "  token role: $(jq -r '.auth.accessToken.role // "?"' /tmp/whoami.json)"
+
       - name: Push mirror to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
