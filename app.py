@@ -65,6 +65,22 @@ REB_OFFLINE_END = 14              # signal returns at this point in the cycle
 MODEL_SAMPLE_INTERVAL_SEC = 15.0  # matches training step of model.pkl
 MODEL_HISTORY_LEN = 5
 
+# Max single-tick "snap" distance when Wi-Fi correction pulls the display
+# toward its target. EMA smoothing alone doesn't fix this (verified
+# empirically): scan_at()'s shadow fading isn't seeded, so the RSSI scan (and
+# therefore the match) is noisy tick to tick even at a near-constant true
+# position, and the match is systematically biased backward too (averaging
+# the top-5 fingerprints centroids toward the already-traveled stretch, not
+# the current edge) — EMA only softens that pull, it doesn't remove it, so
+# the display still drifted backward within a route segment periodically.
+# Instead the display ALWAYS advances forward by at least dr_step_m (the
+# same route-geometry physics dr uses), and Wi-Fi is only allowed to snap the
+# display CLOSER to dr than that forward step already is — otherwise the
+# correction is ignored for that tick. This structurally rules out both
+# freezing (there's always a forward step) and backward motion (correction
+# never applies if it would move the display away from dr).
+MAX_WIFI_SNAP_M = 15.0
+
 SPEED_NOISE_STD_KMH = 0.9
 SPEED_NOISE_DECAY = 0.85
 SPEED_NOISE_CLAMP_KMH = 3.0
@@ -421,10 +437,12 @@ def step_vehicle(v, dt):
         # same correction back in every tick: the point converges to a fixed
         # offset from the matched fingerprint and stalls there for the rest
         # of the outage, then snaps to the real position once GPS returns.
+        prev_dr_lat, prev_dr_lon = v["dr_lat"], v["dr_lon"]
         dr_lat, dr_lon, dr_idx, _ = ru.advance_along_route(
             route_coords, v["dr_idx"], v["dr_lat"], v["dr_lon"], speed_mps * dt
         )
         v["dr_idx"], v["dr_lat"], v["dr_lon"] = dr_idx, dr_lat, dr_lon
+        dr_step_m = ru.calculate_distance(prev_dr_lat, prev_dr_lon, dr_lat, dr_lon)
 
         v["speed"] = predicted_speed
         v["speed_buffer"].append(predicted_speed)
@@ -448,24 +466,46 @@ def step_vehicle(v, dt):
             w = wifi_fp.correction_weight(match["confidence"])
             corrected_lat = (1 - w) * dr_lat + w * match["lat"]
             corrected_lon = (1 - w) * dr_lon + w * match["lon"]
-            corrected_idx = ru.nearest_route_index(route_coords, corrected_lat, corrected_lon, search_from=dr_idx)
             v["wifi_status"] = "matched" if w > 0 else "searching"
             v["wifi_confidence"] = match["confidence"]
         else:
-            corrected_lat, corrected_lon, corrected_idx = dr_lat, dr_lon, dr_idx
+            corrected_lat, corrected_lon = dr_lat, dr_lon
             v["wifi_status"] = "searching"
             v["wifi_confidence"] = 0.0
 
-        if corrected_idx != v["idx"]:
-            v["heading"] = ru.heading_for_route_idx(route_coords, corrected_idx)
+        # Forward baseline: the display ALWAYS advances along the route by
+        # dr_step_m (the same route-geometry physics dr uses) — guaranteed
+        # forward, never frozen.
+        fwd_lat, fwd_lon, _, _ = ru.advance_along_route(route_coords, v["idx"], v["lat"], v["lon"], dr_step_m)
 
-        v["idx"], v["lat"], v["lon"] = corrected_idx, corrected_lat, corrected_lon
+        # Wi-Fi correction is only applied if it puts the display CLOSER to
+        # dr than the forward baseline already is — otherwise this tick's
+        # correction is ignored and the forward step stands. Even when
+        # accepted, the jump toward it is capped at MAX_WIFI_SNAP_M.
+        dist_corrected_to_dr = ru.calculate_distance(corrected_lat, corrected_lon, dr_lat, dr_lon)
+        dist_fwd_to_dr = ru.calculate_distance(fwd_lat, fwd_lon, dr_lat, dr_lon)
+
+        if dist_corrected_to_dr < dist_fwd_to_dr:
+            snap_step_m = ru.calculate_distance(fwd_lat, fwd_lon, corrected_lat, corrected_lon)
+            ratio = min(1.0, MAX_WIFI_SNAP_M / snap_step_m) if snap_step_m > 1e-9 else 1.0
+            display_lat = fwd_lat + (corrected_lat - fwd_lat) * ratio
+            display_lon = fwd_lon + (corrected_lon - fwd_lon) * ratio
+        else:
+            display_lat, display_lon = fwd_lat, fwd_lon
+
+        display_idx = ru.nearest_route_index(route_coords, display_lat, display_lon, search_from=v["idx"])
+        display_idx = max(display_idx, v["idx"])  # safety net: never regress
+
+        if display_idx != v["idx"]:
+            v["heading"] = ru.heading_for_route_idx(route_coords, display_idx)
+
+        v["idx"], v["lat"], v["lon"] = display_idx, display_lat, display_lon
         v["is_predicted"] = True
 
         # Diagnostic only (this simulation controls ground truth, a real
         # deployment would not have it): how much did Wi-Fi actually help?
         v["error_ai_m"] = ru.calculate_distance(dr_lat, dr_lon, v["true_lat"], v["true_lon"])
-        v["error_fused_m"] = ru.calculate_distance(corrected_lat, corrected_lon, v["true_lat"], v["true_lon"])
+        v["error_fused_m"] = ru.calculate_distance(display_lat, display_lon, v["true_lat"], v["true_lon"])
 
     return v
 

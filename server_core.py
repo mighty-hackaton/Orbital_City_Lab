@@ -32,6 +32,21 @@ MIN_MOVE_FOR_HEADING_M = 1.0  # нижче — вважаємо GPS-джитте
 MODEL_SAMPLE_INTERVAL_SEC = 15.0
 MODEL_HISTORY_LEN = 5
 
+# Максимальний "стрибок" за один тік, коли Wi-Fi-корекція підтягує показ до
+# скоригованої точки. EMA-згладжування тут НЕ рятує (перевірено емпірично):
+# shadow fading в scan_at() не seeded, тож RSSI-скан (а з ним і сам матч)
+# шумить від тіку до тіку навіть при незмінній істинній позиції, і матч
+# систематично тягне назад (усереднення топ-5 фінгерпринтів дає центроїд
+# уже пройденої ділянки, а не крайню точку). EMA лише пом'якшує цю тягу, але
+# не прибирає — показ все одно час від часу відкочувався в межах сегмента.
+# Замість цього показ ЗАВЖДИ просувається вперед щонайменше на dr_step_m
+# (тими самими geometry-фізикою, що й dr — гарантовано вздовж маршруту), а
+# Wi-Fi дозволено лише "підтягувати" показ БЛИЖЧЕ до dr, ніж просте
+# просування вперед — інакше ігнорується цей тік. Це структурно виключає
+# і зависання (завжди є forward-крок), і рух назад (корекція ніколи не
+# застосовується, якщо вона віддаляє від dr).
+MAX_WIFI_SNAP_M = 15.0
+
 print("⏳ Отримую маршрут (з кешу route_info.json або рахую сам)...")
 route_coords = ru.load_or_build_route()
 cum_dist_arr = ru.build_cumulative_distances(route_coords)
@@ -284,10 +299,12 @@ while True:
             # точку рівноваги за кілька тіків і "зависає" на весь час РЕБ,
             # а по відновленню GNSS реальна позиція (яка постійно рухалась)
             # підмінює її ривком.
+            prev_dr_lat, prev_dr_lon = state["dr_lat"], state["dr_lon"]
             dr_lat, dr_lon, dr_idx, reached_end = ru.advance_along_route(
                 route_coords, state["dr_idx"], state["dr_lat"], state["dr_lon"], speed_mps * dt
             )
             state["dr_lat"], state["dr_lon"], state["dr_idx"] = dr_lat, dr_lon, dr_idx
+            dr_step_m = ru.calculate_distance(prev_dr_lat, prev_dr_lon, dr_lat, dr_lon)
 
             # Wi-Fi-корекція: якщо GNSS глушиться, але дані ще долітають
             # (найчастіший реальний випадок), у нас є свіжий скан з ІСТИННОЇ
@@ -298,21 +315,45 @@ while True:
                 w = wifi_fp.correction_weight(match["confidence"])
                 corrected_lat = (1 - w) * dr_lat + w * match["lat"]
                 corrected_lon = (1 - w) * dr_lon + w * match["lon"]
-                corrected_idx = ru.nearest_route_index(route_coords, corrected_lat, corrected_lon, search_from=dr_idx)
                 state["wifi_status"] = "matched" if w > 0 else "searching"
                 state["wifi_confidence"] = match["confidence"]
             else:
-                corrected_lat, corrected_lon, corrected_idx = dr_lat, dr_lon, dr_idx
+                corrected_lat, corrected_lon = dr_lat, dr_lon
                 state["wifi_status"] = "searching"
                 state["wifi_confidence"] = 0.0
 
-            if corrected_idx != state["route_idx"]:
-                state["heading"] = ru.heading_for_route_idx(route_coords, corrected_idx)
+            # Forward-базова лінія: показ ЗАВЖДИ просувається вздовж маршруту
+            # на dr_step_m (та сама фізика, що й dr) — гарантовано вперед,
+            # ніколи не назад, ніколи не заморожено.
+            fwd_lat, fwd_lon, _, _ = ru.advance_along_route(
+                route_coords, state["route_idx"], state["lat"], state["lon"], dr_step_m
+            )
+
+            # Wi-Fi-корекцію застосовуємо, лише якщо вона робить показ
+            # БЛИЖЧИМ до dr, ніж форвардна базова лінія — інакше цей тік
+            # просто ігноруємо (лишаємо forward-крок як є). Навіть коли
+            # корекція приймається, стрибок до неї обмежений MAX_WIFI_SNAP_M.
+            dist_corrected_to_dr = ru.calculate_distance(corrected_lat, corrected_lon, dr_lat, dr_lon)
+            dist_fwd_to_dr = ru.calculate_distance(fwd_lat, fwd_lon, dr_lat, dr_lon)
+
+            if dist_corrected_to_dr < dist_fwd_to_dr:
+                snap_step_m = ru.calculate_distance(fwd_lat, fwd_lon, corrected_lat, corrected_lon)
+                ratio = min(1.0, MAX_WIFI_SNAP_M / snap_step_m) if snap_step_m > 1e-9 else 1.0
+                display_lat = fwd_lat + (corrected_lat - fwd_lat) * ratio
+                display_lon = fwd_lon + (corrected_lon - fwd_lon) * ratio
+            else:
+                display_lat, display_lon = fwd_lat, fwd_lon
+
+            display_idx = ru.nearest_route_index(route_coords, display_lat, display_lon, search_from=state["route_idx"])
+            display_idx = max(display_idx, state["route_idx"])  # запобіжник: ніколи не відкочуємось назад
+
+            if display_idx != state["route_idx"]:
+                state["heading"] = ru.heading_for_route_idx(route_coords, display_idx)
 
             state.update({
-                "lat": corrected_lat,
-                "lon": corrected_lon,
-                "route_idx": corrected_idx,
+                "lat": display_lat,
+                "lon": display_lon,
+                "route_idx": display_idx,
                 "last_update_time": current_time,
                 "is_predicted": True,
             })
@@ -322,7 +363,7 @@ while True:
                 state["speed_buffer"].pop(0)
 
             tag = "🏁 КІНЕЦЬ МАРШРУТУ" if reached_end else "🔴 DEAD RECKONING"
-            print(f"[{tag}] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | idx={corrected_idx} | "
+            print(f"[{tag}] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | idx={display_idx} | "
                   f"Wi-Fi: {state['wifi_status']} ({state['wifi_confidence']*100:.0f}%)")
 
     save_state_atomic(vehicles)
