@@ -7,6 +7,7 @@ import joblib
 
 import feature_utils
 import route_utils as ru
+import wifi_fingerprint as wifi_fp
 
 # ==========================================
 # 1. КОНФІГУРАЦІЯ
@@ -14,6 +15,9 @@ import route_utils as ru
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 
+# Повне мовчання борта довше цього — це вже не "GNSS глушиться", а взагалі
+# немає зв'язку (GSM/LTE теж пропав). Тоді ми не отримуємо навіть свіжого
+# Wi-Fi-скану, і лишається чисте AI+геометрія dead reckoning, як і було.
 TIMEOUT_THRESHOLD = 1.5
 STATE_FILE = "dashboard_state.json"
 # Синхронізовано з SEND_PERIOD_SEC у клієнті (0.5с) — частіші апдейти дають
@@ -30,6 +34,7 @@ MODEL_HISTORY_LEN = 5
 
 print("⏳ Отримую маршрут (з кешу route_info.json або рахую сам)...")
 route_coords = ru.load_or_build_route()
+cum_dist_arr = ru.build_cumulative_distances(route_coords)
 print(f"✅ Маршрут готовий: {len(route_coords)} точок. (граф OSM серверу під час роботи не потрібен)")
 
 print("⏳ Завантаження ML-моделі HistGradientBoostingRegressor (v3, з курсом)...")
@@ -40,9 +45,15 @@ except Exception as e:
     print(f"⚠️ Помилка завантаження моделі: {e}")
     ai_model = None
 
+# Wi-Fi fingerprint база — на реальному сервері це таблиця в БД, спільна
+# для ВСЬОГО флоту (кожен борт і поповнює, і користується нею). Тут —
+# процес-локальний Python-об'єкт, семантика та сама.
+fp_store = wifi_fp.FingerprintStore()
+print("✅ Wi-Fi fingerprint база ініціалізована (порожня, наповнюється в реальному часі).")
+
 
 # ==========================================
-# 2. ПРОГНОЗ ШВИДКОСТІ
+# 2. ПРОГНОЗ ШВИДКОСТІ (AI + геометрія)
 # ==========================================
 def start_reb_prediction(state, current_time):
     """Викликається ОДИН РАЗ у момент входу в РЕБ — а не щотіку.
@@ -137,13 +148,19 @@ while True:
     loop_start = time.time()
     current_time = loop_start
 
-    # --- ПРИЙОМ ДАНИХ (ОНЛАЙН) ---
+    # --- ПРИЙОМ ПАКЕТА (може мати gps_fix=True АБО False — див. client_sim.py) ---
     try:
-        data, addr = sock.recvfrom(1024)
+        data, addr = sock.recvfrom(2048)
         packet = json.loads(data.decode("utf-8"))
         v_id = packet["id"]
+        gps_fix = packet.get("gps_fix", True) and "lat" in packet
+        wifi_scan = packet.get("wifi") or {}
 
         if v_id not in vehicles:
+            if not gps_fix:
+                # Перший-ліпший пакет від нового борта без координат —
+                # нема з чого стартувати стан, чекаємо першого GNSS-фіксу.
+                raise KeyError("no initial fix yet")
             vehicles[v_id] = {
                 "speed_buffer": [],
                 "heading": 0.0,
@@ -152,64 +169,92 @@ while True:
                 "model_heading_window": [],
                 "next_model_sample_time": current_time,
                 "reb_interp": None,
+                "last_wifi_scan": {},
+                "gps_fix_live": True,
+                "wifi_status": "ok",
+                "wifi_confidence": 0.0,
             }
 
         state = vehicles[v_id]
-        prev_lat, prev_lon = state.get("lat"), state.get("lon")
+        state["last_packet_time"] = current_time  # "будь-який пакет" — вартовий повного мовчання
 
-        # Heading рахуємо САМІ з реального переміщення між двома останніми
-        # точками, а не з поля пакета — клієнт його не рахує.
-        heading = state.get("heading", 0.0)
-        if prev_lat is not None:
-            moved = ru.calculate_distance(prev_lat, prev_lon, packet["lat"], packet["lon"])
-            if moved > MIN_MOVE_FOR_HEADING_M:
-                heading = ru.calculate_bearing(prev_lat, prev_lon, packet["lat"], packet["lon"])
+        if gps_fix:
+            # --- GNSS живий: маємо справжню координату ---
+            prev_lat, prev_lon = state.get("lat"), state.get("lon")
 
-        # Прив'язуємо машину до найближчої точки ВІДОМОГО маршруту. Пошук
-        # обмежений околом попереднього route_idx, щоб не "перескочити" на
-        # схожу, але не ту ділянку дороги.
-        route_idx = ru.nearest_route_index(
-            route_coords, packet["lat"], packet["lon"], search_from=state.get("route_idx", 0)
-        )
+            # Heading рахуємо САМІ з реального переміщення між двома останніми
+            # точками, а не з поля пакета — клієнт його не рахує.
+            heading = state.get("heading", 0.0)
+            if prev_lat is not None:
+                moved = ru.calculate_distance(prev_lat, prev_lon, packet["lat"], packet["lon"])
+                if moved > MIN_MOVE_FOR_HEADING_M:
+                    heading = ru.calculate_bearing(prev_lat, prev_lon, packet["lat"], packet["lon"])
 
-        state.update({
-            "last_packet_time": current_time,   # для рішення "звʼязок є / нема"
-            "last_update_time": current_time,   # для розрахунку dt фізичного кроку
-            "lat": packet["lat"],
-            "lon": packet["lon"],
-            "heading": heading,
-            "route_idx": route_idx,
-            "is_predicted": False,
-            "reb_interp": None,  # звʼязок відновився — старий прогноз більше не актуальний
-        })
+            # Прив'язуємо машину до найближчої точки ВІДОМОГО маршруту. Пошук
+            # обмежений околом попереднього route_idx, щоб не "перескочити" на
+            # схожу, але не ту ділянку дороги.
+            route_idx = ru.nearest_route_index(
+                route_coords, packet["lat"], packet["lon"], search_from=state.get("route_idx", 0)
+            )
 
-        state["speed_buffer"].append(packet["speed"])
-        if len(state["speed_buffer"]) > 5:
-            state["speed_buffer"].pop(0)
+            state.update({
+                "last_update_time": current_time,   # для розрахунку dt фізичного кроку
+                "lat": packet["lat"],
+                "lon": packet["lon"],
+                "heading": heading,
+                "route_idx": route_idx,
+                "is_predicted": False,
+                "gps_fix_live": True,
+                "reb_interp": None,  # звʼязок відновився — старий прогноз більше не актуальний
+            })
 
-        # Окремий буфер для МОДЕЛІ: семплюємо РАЗ на MODEL_SAMPLE_INTERVAL_SEC
-        # секунд, а не щопакета — інакше вікно не відповідатиме тому, на
-        # чому тренувались (посекундні дані замість 15-секундних).
-        if current_time >= state["next_model_sample_time"]:
-            state["model_speed_window"].append(packet["speed"])
-            state["model_heading_window"].append(heading)
-            if len(state["model_speed_window"]) > MODEL_HISTORY_LEN:
-                state["model_speed_window"].pop(0)
-                state["model_heading_window"].pop(0)
-            state["next_model_sample_time"] = current_time + MODEL_SAMPLE_INTERVAL_SEC
+            state["speed_buffer"].append(packet["speed"])
+            if len(state["speed_buffer"]) > 5:
+                state["speed_buffer"].pop(0)
 
-        print(f"[🟢 ONLINE] Авто {v_id} | Швидкість: {packet['speed']:.1f} км/год | idx={route_idx}")
+            # Окремий буфер для МОДЕЛІ: семплюємо РАЗ на MODEL_SAMPLE_INTERVAL_SEC
+            # секунд, а не щопакета — інакше вікно не відповідатиме тому, на
+            # чому тренувались (посекундні дані замість 15-секундних).
+            if current_time >= state["next_model_sample_time"]:
+                state["model_speed_window"].append(packet["speed"])
+                state["model_heading_window"].append(heading)
+                if len(state["model_speed_window"]) > MODEL_HISTORY_LEN:
+                    state["model_speed_window"].pop(0)
+                    state["model_heading_window"].pop(0)
+                state["next_model_sample_time"] = current_time + MODEL_SAMPLE_INTERVAL_SEC
+
+            # GNSS живий — це достовірна позиція, тож саме зараз записуємо
+            # Wi-Fi fingerprint (а не під час РЕБ, коли позиція вже оцінка).
+            cum_dist_here = ru.cumulative_distance_at(route_coords, cum_dist_arr, route_idx, packet["lat"], packet["lon"])
+            fp_store.maybe_record(v_id, packet["lat"], packet["lon"], route_idx, wifi_scan, cum_dist_here)
+            state["wifi_status"] = "ok" if wifi_scan else "no_ap"
+            state["wifi_confidence"] = 0.0
+
+            print(f"[🟢 GNSS] Авто {v_id} | Швидкість: {packet['speed']:.1f} км/год | idx={route_idx} | Wi-Fi AP: {len(wifi_scan)}")
+
+        else:
+            # --- GNSS глушиться, але пакет ДІЙШОВ — маємо свіжий Wi-Fi-скан ---
+            state["gps_fix_live"] = False
+            state["last_wifi_scan"] = wifi_scan
+            print(f"[📶 GNSS ВТРАЧЕНО, Wi-Fi живий] Авто {v_id} | AP видно: {len(wifi_scan)}")
 
     except socket.timeout:
+        pass
+    except KeyError:
         pass
     except Exception as e:
         print(f"⚠️ Помилка прийому пакета: {e}")
 
-    # --- АВТОНОМНИЙ РУХ (РЕБ) ---
+    # --- DEAD RECKONING: коли GNSS не живий (пакет каже gps_fix=False)
+    # АБО коли взагалі немає пакетів довше TIMEOUT_THRESHOLD (повна тиша) ---
     for v_id, state in vehicles.items():
         if "lat" not in state:
             continue
-        if current_time - state.get("last_packet_time", 0) > TIMEOUT_THRESHOLD:
+
+        total_silence = current_time - state.get("last_packet_time", 0) > TIMEOUT_THRESHOLD
+        gnss_jammed = not state.get("gps_fix_live", True)
+
+        if gnss_jammed or total_silence:
             if state.get("reb_interp") is None:
                 state["reb_interp"] = start_reb_prediction(state, current_time)
 
@@ -221,28 +266,38 @@ while True:
             # реальне авто, а не стрибав до цілі за один тік.
             predicted_speed = max(15.0, ru.step_speed_toward(last_actual_speed, model_speed_now))
 
-            # dt рахуємо ФАКТИЧНИЙ, а не берем фіксований TICK_SEC. Раніше
-            # last_seen перезаписувався на current_time щотіку REB-блоку,
-            # через що умова "current_time - last_seen > TIMEOUT_THRESHOLD"
-            # одразу ставала хибною — сервер фактично оновлював позицію не
-            # щосекунди, а раз на TIMEOUT_THRESHOLD секунд, і при цьому рухав
-            # машину так, ніби минула лише 1 секунда. Тепер last_packet_time
-            # (рішення онлайн/офлайн) і last_update_time (для dt) розведені.
             dt = current_time - state.get("last_update_time", current_time)
             dt = max(0.0, min(dt, 5.0))  # захист від аномально великого dt (пауза дебагера тощо)
             speed_mps = predicted_speed * (1000 / 3600)
 
-            new_lat, new_lon, new_idx, reached_end = ru.advance_along_route(
+            dr_lat, dr_lon, dr_idx, reached_end = ru.advance_along_route(
                 route_coords, state["route_idx"], state["lat"], state["lon"], speed_mps * dt
             )
 
-            if new_idx != state["route_idx"]:
-                state["heading"] = ru.heading_for_route_idx(route_coords, new_idx)
+            # Wi-Fi-корекція: якщо GNSS глушиться, але дані ще долітають
+            # (найчастіший реальний випадок), у нас є свіжий скан з ІСТИННОЇ
+            # позиції борта — навіть коли повна тиша (total_silence) і скан
+            # застарілий, спробувати збіг все одно варто, просто шанс нижчий.
+            match = fp_store.match(state.get("last_wifi_scan") or {})
+            if match is not None:
+                w = wifi_fp.correction_weight(match["confidence"])
+                corrected_lat = (1 - w) * dr_lat + w * match["lat"]
+                corrected_lon = (1 - w) * dr_lon + w * match["lon"]
+                corrected_idx = ru.nearest_route_index(route_coords, corrected_lat, corrected_lon, search_from=dr_idx)
+                state["wifi_status"] = "matched" if w > 0 else "searching"
+                state["wifi_confidence"] = match["confidence"]
+            else:
+                corrected_lat, corrected_lon, corrected_idx = dr_lat, dr_lon, dr_idx
+                state["wifi_status"] = "searching"
+                state["wifi_confidence"] = 0.0
+
+            if corrected_idx != state["route_idx"]:
+                state["heading"] = ru.heading_for_route_idx(route_coords, corrected_idx)
 
             state.update({
-                "lat": new_lat,
-                "lon": new_lon,
-                "route_idx": new_idx,
+                "lat": corrected_lat,
+                "lon": corrected_lon,
+                "route_idx": corrected_idx,
                 "last_update_time": current_time,
                 "is_predicted": True,
             })
@@ -251,8 +306,9 @@ while True:
             if len(state["speed_buffer"]) > 5:
                 state["speed_buffer"].pop(0)
 
-            tag = "🏁 КІНЕЦЬ МАРШРУТУ" if reached_end else "🔴 РЕБ"
-            print(f"[{tag}] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | idx={new_idx}")
+            tag = "🏁 КІНЕЦЬ МАРШРУТУ" if reached_end else "🔴 DEAD RECKONING"
+            print(f"[{tag}] Авто {v_id} | Швидкість: {predicted_speed:.1f} км/год | idx={corrected_idx} | "
+                  f"Wi-Fi: {state['wifi_status']} ({state['wifi_confidence']*100:.0f}%)")
 
     save_state_atomic(vehicles)
 

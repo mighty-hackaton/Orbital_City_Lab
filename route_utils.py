@@ -131,6 +131,31 @@ def advance_along_route(route_coords, idx, lat, lon, dist_to_move):
     return lat, lon, idx, reached_end
 
 
+def build_cumulative_distances(route_coords):
+    """Кумулятивна відстань (у метрах) від початку маршруту до кожної
+    точки. Використовується Wi-Fi fingerprint шаром (wifi_fingerprint.py),
+    щоб вирішувати "чи проїхали ми вже достатньо, щоб записати новий
+    фінгерпринт" — рахувати це наново на кожному тіку було б O(n) щоразу,
+    а маршрут не змінюється, тож рахуємо один раз і кешуємо."""
+    cum = [0.0]
+    for i in range(len(route_coords) - 1):
+        lat1, lon1 = route_coords[i]
+        lat2, lon2 = route_coords[i + 1]
+        cum.append(cum[-1] + calculate_distance(lat1, lon1, lat2, lon2))
+    return cum
+
+
+def cumulative_distance_at(route_coords, cum_dist_arr, idx, lat, lon):
+    """Неперервна відстань уздовж маршруту до поточної (lat, lon), а не
+    лише до найближчого кешованого вузла route_coords[idx]. route_coords
+    з OSM буває дуже розрідженим (вузли графа, а не точки кожні N метрів),
+    тож cum_dist_arr[idx] сам по собі змінюється рідко — Wi-Fi fingerprint
+    шар (wifi_fingerprint.py) записував би фінгерпринти набагато рідше, ніж
+    RECORD_EVERY_M, якби рахував відстань лише по індексу вузла."""
+    idx = max(0, min(idx, len(route_coords) - 1))
+    return cum_dist_arr[idx] + calculate_distance(*route_coords[idx], lat, lon)
+
+
 def heading_for_route_idx(route_coords, idx):
     """Напрямок наступного сегмента маршруту за індексом — використовується
     сервером одразу після переходу на новий сегмент під час dead reckoning."""
