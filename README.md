@@ -58,6 +58,9 @@ simulated with a physically-motivated signal-propagation model
 signal-space matching, and position correction in `wifi_fingerprint.py` — is
 the real, deployable algorithm. Feeding it genuine phone/router Wi-Fi scans
 instead of `scan_at()` requires no change to that logic.
+## Try it
+
+▶️ **Live demo:** https://huggingface.co/spaces/mariykart/REBoot
 
 ## How it works
 
