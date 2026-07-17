@@ -601,7 +601,10 @@ with st.sidebar:
             <b style="color:#F3F6FB;">Кільце невизначеності</b> — росте з часом без сигналу, стискається
             при впевненому Wi-Fi-збігу.<br><br>
             <span class="dot" style="background:#8B96AB;"></span>
-            <b style="color:#F3F6FB;">Остання відома GPS-точка</b> — де сигнал востаннє підтвердив позицію.
+            <b style="color:#F3F6FB;">Остання відома GPS-точка</b> — де сигнал востаннє підтвердив позицію.<br><br>
+            <span class="dot" style="background:#3B82F6;"></span>
+            <b style="color:#F3F6FB;">Wi-Fi точка доступу</b> — синтетична AP вздовж маршруту; прозоре коло —
+            дальність, у межах якої вона видима скану.
         </div>
         """,
         unsafe_allow_html=True,
@@ -633,6 +636,7 @@ st.markdown(
         <div><span class="dot" style="background:#FB7185;"></span><b>Втрата сигналу</b> — AI + Wi-Fi корекція</div>
         <div><span class="ring"></span><b>Невизначеність</b> — росте без сигналу, стискається Wi-Fi</div>
         <div><span class="dot" style="background:#8B96AB;"></span><b>Остання GPS-точка</b></div>
+        <div><span class="dot" style="background:#3B82F6;"></span><b>Wi-Fi точка доступу</b></div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -733,6 +737,7 @@ def render():
         SIGNAL_GREEN = [45, 212, 158]
         SIGNAL_RED = [251, 113, 133]
         LAST_GPS_GRAY = [148, 163, 184]
+        AP_BLUE = [59, 130, 246]
 
         layers = []
 
@@ -745,6 +750,31 @@ def render():
             width_min_pixels=3,
         )
         layers.append(path_layer)
+
+        # Wi-Fi access points: faint transparent circle showing simulated
+        # detection range (AP_MAX_RANGE_M — beyond this scan_at() no longer
+        # sees the AP), plus a small solid dot marking the AP itself.
+        ap_positions = [{"coord": [ap["lon"], ap["lat"]]} for ap in ap_field]
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=ap_positions,
+            get_position="coord",
+            get_radius=wifi_fp.AP_MAX_RANGE_M,
+            get_fill_color=AP_BLUE + [18],
+            stroked=False,
+            filled=True,
+        ))
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=ap_positions,
+            get_position="coord",
+            get_fill_color=AP_BLUE + [230],
+            get_line_color=[10, 14, 23, 255],
+            stroked=True,
+            line_width_min_pixels=1,
+            get_radius=8,
+            radius_min_pixels=3,
+        ))
 
         endpoints = [
             {"coord": [route_coords[0][1], route_coords[0][0]], "color": SIGNAL_GREEN + [210]},
