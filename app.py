@@ -254,6 +254,11 @@ def new_vehicle(name, start_offset_idx, phase_offset_sec):
         "name": name,
         # --- reported/displayed position: what the passenger sees ---
         "idx": idx, "lat": lat, "lon": lon,
+        # --- raw dead-reckoning accumulator: advances every REB tick on its
+        # own, independent of the Wi-Fi-corrected displayed position (see
+        # note in step_vehicle for why the two must not feed into each
+        # other) ---
+        "dr_idx": idx, "dr_lat": lat, "dr_lon": lon,
         "speed": ru.BASE_SPEED_KMH, "heading": heading,
         # --- hidden ground truth: the vehicle keeps moving for real even
         # when we can't hear from it. Only used inside this simulation to
@@ -367,6 +372,7 @@ def step_vehicle(v, dt):
     if not signal_lost:
         # --- GPS/GSM link is up: what we report IS the truth ---
         v["idx"], v["lat"], v["lon"] = v["true_idx"], v["true_lat"], v["true_lon"]
+        v["dr_idx"], v["dr_lat"], v["dr_lon"] = v["true_idx"], v["true_lat"], v["true_lon"]
         v["speed"], v["heading"] = v["true_speed"], v["true_heading"]
         v["is_predicted"] = False
         v["reb_interp"] = None
@@ -409,9 +415,16 @@ def step_vehicle(v, dt):
         predicted_speed = max(15.0, ru.step_speed_toward(last_actual_speed, model_speed_now, dt_sec=dt))
         speed_mps = predicted_speed * (1000 / 3600)
 
+        # Advance the RAW dr accumulator from its own previous step, not from
+        # v["lat"]/["lon"] — those may already be pulled toward a Wi-Fi
+        # match below. Starting from the corrected position would feed that
+        # same correction back in every tick: the point converges to a fixed
+        # offset from the matched fingerprint and stalls there for the rest
+        # of the outage, then snaps to the real position once GPS returns.
         dr_lat, dr_lon, dr_idx, _ = ru.advance_along_route(
-            route_coords, v["idx"], v["lat"], v["lon"], speed_mps * dt
+            route_coords, v["dr_idx"], v["dr_lat"], v["dr_lon"], speed_mps * dt
         )
+        v["dr_idx"], v["dr_lat"], v["dr_lon"] = dr_idx, dr_lat, dr_lon
 
         v["speed"] = predicted_speed
         v["speed_buffer"].append(predicted_speed)

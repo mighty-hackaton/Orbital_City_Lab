@@ -206,6 +206,12 @@ while True:
                 "is_predicted": False,
                 "gps_fix_live": True,
                 "reb_interp": None,  # звʼязок відновився — старий прогноз більше не актуальний
+                # Сирий DR-акумулятор синхронізуємо з підтвердженою позицією —
+                # інакше він тягнув би за собою offset, накопичений під час
+                # попереднього РЕБ.
+                "dr_lat": packet["lat"],
+                "dr_lon": packet["lon"],
+                "dr_idx": route_idx,
             })
 
             state["speed_buffer"].append(packet["speed"])
@@ -270,9 +276,18 @@ while True:
             dt = max(0.0, min(dt, 5.0))  # захист від аномально великого dt (пауза дебагера тощо)
             speed_mps = predicted_speed * (1000 / 3600)
 
+            # Просуваємо СИРИЙ dead reckoning від його ж попереднього кроку, а
+            # не від state["lat"]/["lon"] — ті вже могли бути притягнуті
+            # Wi-Fi-корекцією нижче. Якщо брати за старт відкориговану
+            # позицію, corrected_lat/lon кожного тіку знову тягне ЦЮ Ж точку
+            # назад до того самого якоря — точка збігається в нерухому
+            # точку рівноваги за кілька тіків і "зависає" на весь час РЕБ,
+            # а по відновленню GNSS реальна позиція (яка постійно рухалась)
+            # підмінює її ривком.
             dr_lat, dr_lon, dr_idx, reached_end = ru.advance_along_route(
-                route_coords, state["route_idx"], state["lat"], state["lon"], speed_mps * dt
+                route_coords, state["dr_idx"], state["dr_lat"], state["dr_lon"], speed_mps * dt
             )
+            state["dr_lat"], state["dr_lon"], state["dr_idx"] = dr_lat, dr_lon, dr_idx
 
             # Wi-Fi-корекція: якщо GNSS глушиться, але дані ще долітають
             # (найчастіший реальний випадок), у нас є свіжий скан з ІСТИННОЇ

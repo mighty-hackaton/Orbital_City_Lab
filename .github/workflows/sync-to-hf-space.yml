@@ -1,9 +1,19 @@
 name: Sync to Hugging Face Space
 
-# Дзеркалить main-гілку в git-репозиторій Hugging Face Space при кожному
-# push у GitHub. Space (huggingface.co/spaces/mariykart/REBoot) — це
-# ОКРЕМИЙ git-репозиторій, не форк і не клон GitHub; без цього кроку зміни
-# тут ніколи самі не з'являться на живому демо.
+# Публікує чистий знімок поточного стану репозиторію в git-репозиторій
+# Hugging Face Space при кожному push у GitHub. Space
+# (huggingface.co/spaces/mariykart/REBoot) — це ОКРЕМИЙ git-репозиторій,
+# не форк і не клон GitHub; без цього кроку зміни тут ніколи самі не
+# з'являться на живому демо.
+#
+# Свідомо НЕ дзеркалимо повну git-історію (git push --force space HEAD:main
+# з повною історією GitHub) — HF відхиляє будь-які нативні git-blob'и
+# бінарних файлів ("contains binary files... use Xet/LFS"), а наша історія
+# вже містить model.pkl закомічений як звичайний blob у старих комітах.
+# Замість боротьби з переписуванням історії просто публікуємо ОДИН
+# commit поточного робочого дерева в свіжому репо, де model.pkl від самого
+# початку затрекано через Git LFS — Space не потребує нашої історії
+# комітів, лише актуального стану файлів.
 on:
   push:
     branches: [main]
@@ -14,41 +24,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # повна історія — force-push вимагає всіх комітів, не тільки останнього
 
-      # Тимчасовий діагностичний крок: НІКОЛИ не друкує сам токен, лише його
-      # довжину (0 = секрет не долетів до job) і роль/статус за версією HF
-      # API — щоб не гадати, а точно побачити причину помилки авторизації.
-      # Прибрати цей крок, коли push нижче запрацює стабільно.
-      - name: Debug HF_TOKEN (safe — no secret value is ever printed)
+      - name: Publish a clean LFS-tracked snapshot to the Space
         env:
           HF_TOKEN: ${{ secrets.HF_PUSH }}
         run: |
-          echo "Token length as seen by this job: ${#HF_TOKEN}"
-          if [ -z "$HF_TOKEN" ]; then
-            echo "❌ HF_TOKEN порожній у цьому job. Найімовірніші причини:"
-            echo "   - секрет доданий як 'Environment secret', а не 'Repository secret'"
-            echo "     (тоді job має явно вказувати 'environment: <назва>')"
-            echo "   - назва секрету не збігається символ-в-символ з HF_PUSH"
-            exit 1
-          fi
-          echo "✅ HF_TOKEN має значення. Перевіряю його валідність і роль через HF API..."
-          http_code=$(curl -s -o /tmp/whoami.json -w "%{http_code}" -H "Authorization: Bearer ${HF_TOKEN}" https://huggingface.co/api/whoami-v2)
-          echo "HTTP статус /api/whoami-v2: ${http_code}"
-          if [ "$http_code" != "200" ]; then
-            echo "❌ Токен НЕ валідний (сервер відповів ${http_code}, не 200) — імовірно протух/відкликаний/скопійований з помилкою."
-            cat /tmp/whoami.json
-            exit 1
-          fi
-          echo "Ідентичність токена (тільки безпечні поля, без секретів):"
-          echo "  name: $(jq -r '.name // "?"' /tmp/whoami.json)"
-          echo "  type: $(jq -r '.type // "?"' /tmp/whoami.json)"
-          echo "  token role: $(jq -r '.auth.accessToken.role // "?"' /tmp/whoami.json)"
+          set -e
+          SNAPSHOT=/tmp/space-snapshot
+          rm -rf "$SNAPSHOT"
+          mkdir -p "$SNAPSHOT"
 
-      - name: Push mirror to Hugging Face Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_PUSH }}
-        run: |
-          git remote add space https://mariykart:${HF_TOKEN}@huggingface.co/spaces/mariykart/REBoot
-          git push --force space HEAD:main
+          # Копіюємо робоче дерево як є, окрім .git та кеш-сміття, яке
+          # взагалі не мало б жити в git (build-артефакти).
+          rsync -a --exclude='.git' --exclude='__pycache__' --exclude='.ipynb_checkpoints' \
+                ./ "$SNAPSHOT"/
+
+          cd "$SNAPSHOT"
+          git init -q -b main
+          git config user.email "ci@orbital-city-lab.local"
+          git config user.name "Orbital City Lab CI"
+
+          git lfs install --local
+          git lfs track "*.pkl"
+          git add .gitattributes
+          git add -A
+          git commit -q -m "Sync from GitHub ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+          git remote add space "https://mariykart:${HF_TOKEN}@huggingface.co/spaces/mariykart/REBoot"
+          git push --force space main
